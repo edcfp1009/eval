@@ -79,8 +79,8 @@ def extract_case_marker(input_text: str) -> str | None:
     """Return zero-padded case number string (e.g. '03') or None."""
     if not input_text:
         return None
-    # Match [case_XX] or [case_X]
-    m = re.search(r"\[case_(\d+)\]", input_text, re.IGNORECASE)
+    # Match [case_XX], [case_X], [caseXX], or [caseX]
+    m = re.search(r"\[case_?(\d+)\]", input_text, re.IGNORECASE)
     if m:
         return m.group(1).zfill(2)
     return None
@@ -348,14 +348,17 @@ def _run(args) -> None:
         if existing is None:
             seen_cases[cn] = t
         else:
-            # Keep the one with the later timestamp
+            # Prefer trace with tool calls; break ties by newest timestamp
+            has_tools_new = bool(t.get("tool_calls"))
+            has_tools_old = bool(existing.get("tool_calls"))
             ts_new = t.get("timestamp", "") or ""
             ts_old = existing.get("timestamp", "") or ""
-            if ts_new > ts_old:
-                print(f"  WARNING: duplicate [case_{cn}] — discarding older trace {existing['traceId'][:16]}..., keeping {t['traceId'][:16]}...")
+            prefer_new = (has_tools_new and not has_tools_old) or (has_tools_new == has_tools_old and ts_new > ts_old)
+            if prefer_new:
+                print(f"  WARNING: duplicate [case_{cn}] — discarding trace {existing['traceId'][:16]}..., keeping {t['traceId'][:16]}...")
                 seen_cases[cn] = t
             else:
-                print(f"  WARNING: duplicate [case_{cn}] — discarding older trace {t['traceId'][:16]}..., keeping {existing['traceId'][:16]}...")
+                print(f"  WARNING: duplicate [case_{cn}] — discarding trace {t['traceId'][:16]}..., keeping {existing['traceId'][:16]}...")
 
     deduped_traces = list(seen_cases.values())
 
