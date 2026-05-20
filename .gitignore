@@ -5,3 +5,7 @@
 *.jsonl
 
 .claude/settings.local.json
+
+# Dataset is sourced from Langfuse, never committed
+dataset_v2_*.json
+dataset_*.csv
