@@ -1,0 +1,5 @@
+# Secrets
+.env
+
+# Output files (regenerate with fetch_traces.py)
+*.jsonl
