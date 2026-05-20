@@ -3,3 +3,5 @@
 
 # Output files (regenerate with fetch_traces.py)
 *.jsonl
+
+.claude/settings.local.json
