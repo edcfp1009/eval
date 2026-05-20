@@ -4,13 +4,15 @@ FreightPOP Copilot Eval - Scorer v3 (trace-aware)
 Reads two CSVs and scores each matched case against its expected trajectory.
 
 Required columns:
-    Traces CSV  : traceId, sessionId, output, startTime, datasetItemId
+    Traces CSV  : traceId, sessionId, output, startTime, datasetItemId, tool_calls
     Dataset CSV : id, input, expectedOutput, metadata
 
-The metadata column must contain a JSON object with:
-    expected_trajectory_options : list[list[str]]   — at least one must match
-    must_not                    : list[str]          — tools forbidden in trace
-    case_number                 : str               — e.g. "03"
+The expectedOutput column must contain a JSON object with:
+    tool_calls : list[{"tool": str, "args_must_include": dict}]
+    must_not   : list[str]  — abstract behavior labels (not auto-checkable)
+
+The metadata column may optionally contain:
+    case_number : str|int  — e.g. "03" or 3 (used to build case_id label)
 
 Output (one JSON object per line, written to stdout):
     {"case_id":"case_03","trace_id":"...","passed":false,
@@ -37,23 +39,26 @@ def load_csv(path: str) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def parse_metadata(raw: str) -> dict:
+def parse_json(raw: str) -> dict:
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
 
 
 def parse_tool_calls(raw: str) -> list[str]:
-    """Accept JSON list or comma-separated string."""
+    """Accept JSON list or comma-separated string of tool names."""
     if not raw:
         return []
     raw = raw.strip()
     if raw.startswith("["):
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(t).strip() for t in parsed if t]
         except json.JSONDecodeError:
             pass
     return [t.strip() for t in raw.split(",") if t.strip()]
@@ -68,11 +73,18 @@ def trajectory_matches(actual: list[str], expected: list[str]) -> bool:
 
 
 def score_case(trace: dict, dataset_item: dict) -> dict:
-    meta = parse_metadata(dataset_item.get("metadata", ""))
-    case_number = str(meta.get("case_number", "")).zfill(2)
-    case_id = f"case_{case_number}" if case_number else f"item_{dataset_item.get('id', 'unknown')}"
+    # Build case_id from metadata.case_number if present
+    meta = parse_json(dataset_item.get("metadata", ""))
+    raw_case = meta.get("case_number")
+    if raw_case is not None:
+        case_number = str(raw_case).zfill(2)
+        case_id = f"case_{case_number}"
+    else:
+        case_id = f"item_{dataset_item.get('id', 'unknown')}"
+
     trace_id = trace.get("traceId", "")
 
+    # Actual tool calls from trace
     tool_calls_raw = trace.get("tool_calls", "") or trace.get("output", "")
     actual_tools: list[str] = parse_tool_calls(tool_calls_raw)
 
@@ -90,50 +102,54 @@ def score_case(trace: dict, dataset_item: dict) -> dict:
             "checks": ["no tool calls found in trace"],
         }
 
-    # Check must_not (forbidden tools)
-    must_not: list[str] = meta.get("must_not", [])
-    for forbidden in must_not:
-        if forbidden in actual_tools:
-            passed = False
-            reason = f"forbidden_tool_called — {forbidden}"
-            checks.append(f"FAIL: forbidden tool '{forbidden}' was called")
-            break
-    if not passed:
-        return {"case_id": case_id, "trace_id": trace_id, "passed": passed, "reason": reason, "checks": checks}
+    # Scoring criteria live in expectedOutput (not metadata)
+    expected_output = parse_json(dataset_item.get("expectedOutput", ""))
 
-    # Check expected_trajectory_options
-    options: list[list[str]] = meta.get("expected_trajectory_options", [])
-    if not options:
-        # No trajectory spec — pass by default
-        checks.append("PASS: no expected_trajectory_options defined, treating as pass")
+    # must_not: abstract behavior labels — cannot be auto-checked against tool names
+    must_not: list[str] = expected_output.get("must_not", [])
+    if must_not:
+        checks.append(f"NOTE: must_not behaviors require manual review: {must_not}")
+
+    # expected tool_calls: [{tool: "name", args_must_include: {...}}, ...]
+    expected_entries: list[dict] = expected_output.get("tool_calls", [])
+
+    if not expected_entries:
+        # No tool call spec defined — pass by default
+        checks.append("PASS: no tool_calls defined in expected_output")
         return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
 
-    matched_option = None
-    for option in options:
-        if trajectory_matches(actual_tools, option):
-            matched_option = option
-            break
+    expected_tool_names = [entry.get("tool", "") for entry in expected_entries if entry.get("tool")]
 
-    if matched_option is None:
-        # Find the closest option to give a useful error message
+    if not expected_tool_names:
+        checks.append("PASS: expected tool_calls entries have no tool names")
+        return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+
+    # Check ordered subsequence: all expected tools must appear in actual, in order
+    if trajectory_matches(actual_tools, expected_tool_names):
+        checks.append(f"PASS: matched expected tools {expected_tool_names}")
+        # args_must_include cannot be checked — fetch_traces.py only captures tool names
+        for entry in expected_entries:
+            if entry.get("args_must_include"):
+                checks.append(
+                    f"NOTE: args_must_include for '{entry['tool']}' not auto-checked "
+                    f"(args not captured): {entry['args_must_include']}"
+                )
+    else:
         passed = False
-        best_option = options[0]
-        # Check if it looks like a name mismatch vs a sequence mismatch
         actual_set = set(actual_tools)
-        expected_set = set(best_option)
-        unexpected = actual_set - expected_set
+        expected_set = set(expected_tool_names)
         missing = expected_set - actual_set
+        unexpected = actual_set - expected_set
 
         if missing and not unexpected:
-            first_missing = next(iter(missing))
-            reason = f"missing_required_param — {first_missing}"
-        elif unexpected and len(best_option) == 1:
-            reason = f"tool_name_mismatch — expected {best_option[0]}, got {actual_tools[0] if actual_tools else 'nothing'}"
+            first_missing = sorted(missing)[0]
+            reason = f"missing_required_tool — {first_missing}"
+        elif unexpected and len(expected_tool_names) == 1:
+            got = actual_tools[0] if actual_tools else "nothing"
+            reason = f"tool_name_mismatch — expected {expected_tool_names[0]}, got {got}"
         else:
-            reason = "no expected_trajectory matched"
-        checks.append(f"FAIL: actual={actual_tools}, options={options}")
-    else:
-        checks.append(f"PASS: matched trajectory {matched_option}")
+            reason = "expected_tools_not_matched"
+        checks.append(f"FAIL: actual={actual_tools}, expected={expected_tool_names}")
 
     return {
         "case_id": case_id,
@@ -161,7 +177,7 @@ def main():
         item_id = trace.get("datasetItemId", "")
         if not item_id or item_id not in dataset_by_id:
             result = {
-                "case_id":  f"unmatched_{trace.get('traceId','?')[:8]}",
+                "case_id":  f"unmatched_{trace.get('traceId', '?')[:8]}",
                 "trace_id": trace.get("traceId", ""),
                 "passed":   False,
                 "reason":   f"dataset_item_not_found — id={item_id!r}",
