@@ -7,17 +7,20 @@ Required columns:
     Traces CSV  : traceId, sessionId, output, startTime, datasetItemId, tool_calls
     Dataset CSV : id, input, expectedOutput, metadata
 
-The expectedOutput column must contain a JSON object with:
-    tool_calls : list[{"tool": str, "args_must_include": dict}]
-    must_not   : list[str]  — abstract behavior labels (not auto-checkable)
+Supported expectedOutput schemas (tried in order):
+    tool_calls                     : list[{tool, args_must_include}] — ordered
+    expected_trajectory_options    : list[{label, tools: list[str]}] — any option matches
+    expected_trajectory            : list[{step, tool} | {step_group, tools_unordered}]
+    expected_tools_unordered       : list[str]
+    expected_tools_must_include    : list[str]
+    tool_calls_that_must_not_happen: list[str] — LITERAL tool names forbidden
 
-The metadata column may optionally contain:
-    case_number : str|int  — e.g. "03" or 3 (used to build case_id label)
+Note: must_not items are abstract behavior labels, not literal tool names.
+      tool_calls_that_must_not_happen contains literal tool names.
 
 Output (one JSON object per line, written to stdout):
     {"case_id":"case_03","trace_id":"...","passed":false,
-     "reason":"tool_name_mismatch — expected updateFields, got navigateToPage",
-     "checks":[...]}
+     "reason":"...", "checks":[...]}
 
 Exit code 0 always (caller inspects JSON lines).
 
@@ -49,11 +52,13 @@ def parse_json(raw: str) -> dict:
         return {}
 
 
-def parse_tool_calls(raw: str) -> list[str]:
+def parse_tool_calls(raw) -> list[str]:
     """Accept JSON list or comma-separated string of tool names."""
     if not raw:
         return []
-    raw = raw.strip()
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw if t]
+    raw = str(raw).strip()
     if raw.startswith("["):
         try:
             parsed = json.loads(raw)
@@ -64,100 +69,183 @@ def parse_tool_calls(raw: str) -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-def trajectory_matches(actual: list[str], expected: list[str]) -> bool:
-    """Ordered subsequence check: every tool in expected must appear in actual, in order."""
+def ordered_subsequence_match(actual: list[str], expected: list[str]) -> bool:
+    """All tools in expected must appear in actual, in order."""
     if not expected:
         return True
     it = iter(actual)
     return all(tool in it for tool in expected)
 
 
+def all_present(actual: list[str], required: list[str]) -> tuple[bool, list[str]]:
+    """Check if all required tools appear in actual (any order). Returns (ok, missing)."""
+    actual_set = set(actual)
+    missing = [t for t in required if t not in actual_set]
+    return (len(missing) == 0), missing
+
+
+def extract_trajectory_tools(trajectory: list) -> list[str]:
+    """
+    Flatten expected_trajectory into a list of required tool names.
+    Handles both {step, tool} and {step_group, tools_unordered} shapes.
+    """
+    tools = []
+    for step in trajectory:
+        if isinstance(step, dict):
+            if "tool" in step and step["tool"]:
+                tools.append(step["tool"])
+            if "tools_unordered" in step:
+                tools.extend(step["tools_unordered"])
+    return tools
+
+
 def score_case(trace: dict, dataset_item: dict) -> dict:
-    # Build case_id from metadata.case_number if present
+    # Build case_id label
     meta = parse_json(dataset_item.get("metadata", ""))
     raw_case = meta.get("case_number")
     if raw_case is not None:
-        case_number = str(raw_case).zfill(2)
-        case_id = f"case_{case_number}"
+        case_id = f"case_{str(raw_case).zfill(2)}"
     else:
         case_id = f"item_{dataset_item.get('id', 'unknown')}"
 
     trace_id = trace.get("traceId", "")
-
-    # Actual tool calls from trace
     tool_calls_raw = trace.get("tool_calls", "") or trace.get("output", "")
     actual_tools: list[str] = parse_tool_calls(tool_calls_raw)
 
-    checks = []
-    passed = True
-    reason = None
-
-    # Edge case: no tool calls at all
-    if not actual_tools:
-        return {
-            "case_id": case_id,
-            "trace_id": trace_id,
-            "passed": False,
-            "reason": "no_tool_calls_in_trace",
-            "checks": ["no tool calls found in trace"],
-        }
-
-    # Scoring criteria live in expectedOutput (not metadata)
+    checks: list[str] = []
     expected_output = parse_json(dataset_item.get("expectedOutput", ""))
 
-    # must_not: abstract behavior labels — cannot be auto-checked against tool names
+    # ── 1. Check literal forbidden tools (tool_calls_that_must_not_happen) ──
+    literal_forbidden: list[str] = expected_output.get("tool_calls_that_must_not_happen", [])
+    for forbidden in literal_forbidden:
+        if forbidden in actual_tools:
+            checks.append(f"FAIL: forbidden tool '{forbidden}' was called")
+            return {
+                "case_id": case_id, "trace_id": trace_id,
+                "passed": False,
+                "reason": f"forbidden_tool_called — {forbidden}",
+                "checks": checks,
+            }
+
+    # Note abstract must_not labels (not auto-checkable)
     must_not: list[str] = expected_output.get("must_not", [])
     if must_not:
         checks.append(f"NOTE: must_not behaviors require manual review: {must_not}")
 
-    # expected tool_calls: [{tool: "name", args_must_include: {...}}, ...]
-    expected_entries: list[dict] = expected_output.get("tool_calls", [])
+    # ── 2. Determine expected tools by schema ────────────────────────────────
 
-    if not expected_entries:
-        # No tool call spec defined — pass by default
-        checks.append("PASS: no tool_calls defined in expected_output")
-        return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+    # Schema A: tool_calls list (may be empty for behavior-only cases)
+    if "tool_calls" in expected_output:
+        entries: list = expected_output["tool_calls"]
+        expected_names = [e["tool"] for e in entries if isinstance(e, dict) and e.get("tool")]
 
-    expected_tool_names = [entry.get("tool", "") for entry in expected_entries if entry.get("tool")]
+        if not expected_names:
+            # Behavior-only: no tool calls required
+            # No tool calls in trace is CORRECT for these cases
+            checks.append("PASS: tool_calls=[] — behavior-only case, no tool calls required")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
 
-    if not expected_tool_names:
-        checks.append("PASS: expected tool_calls entries have no tool names")
-        return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+        if not actual_tools:
+            checks.append(f"FAIL: no tool calls in trace, expected {expected_names}")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                    "reason": "no_tool_calls_in_trace", "checks": checks}
 
-    # Check ordered subsequence: all expected tools must appear in actual, in order
-    if trajectory_matches(actual_tools, expected_tool_names):
-        checks.append(f"PASS: matched expected tools {expected_tool_names}")
-        # args_must_include cannot be checked — fetch_traces.py only captures tool names
-        for entry in expected_entries:
-            if entry.get("args_must_include"):
-                checks.append(
-                    f"NOTE: args_must_include for '{entry['tool']}' not auto-checked "
-                    f"(args not captured): {entry['args_must_include']}"
-                )
-    else:
-        passed = False
-        actual_set = set(actual_tools)
-        expected_set = set(expected_tool_names)
-        missing = expected_set - actual_set
-        unexpected = actual_set - expected_set
-
-        if missing and not unexpected:
-            first_missing = sorted(missing)[0]
-            reason = f"missing_required_tool — {first_missing}"
-        elif unexpected and len(expected_tool_names) == 1:
-            got = actual_tools[0] if actual_tools else "nothing"
-            reason = f"tool_name_mismatch — expected {expected_tool_names[0]}, got {got}"
+        if ordered_subsequence_match(actual_tools, expected_names):
+            checks.append(f"PASS: matched tool_calls {expected_names}")
+            for e in entries:
+                if isinstance(e, dict) and e.get("args_must_include"):
+                    checks.append(
+                        f"NOTE: args_must_include for '{e['tool']}' not auto-checked: {e['args_must_include']}"
+                    )
+            return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
         else:
-            reason = "expected_tools_not_matched"
-        checks.append(f"FAIL: actual={actual_tools}, expected={expected_tool_names}")
+            ok, missing = all_present(actual_tools, expected_names)
+            if missing:
+                reason = f"missing_required_tool — {missing[0]}"
+            elif len(expected_names) == 1:
+                got = actual_tools[0] if actual_tools else "nothing"
+                reason = f"tool_name_mismatch — expected {expected_names[0]}, got {got}"
+            else:
+                reason = "expected_tools_not_matched"
+            checks.append(f"FAIL: actual={actual_tools}, expected={expected_names}")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": False, "reason": reason, "checks": checks}
 
-    return {
-        "case_id": case_id,
-        "trace_id": trace_id,
-        "passed": passed,
-        "reason": reason or "ok",
-        "checks": checks,
-    }
+    # Schema B: expected_trajectory_options — any one option must match
+    if "expected_trajectory_options" in expected_output:
+        options: list = expected_output["expected_trajectory_options"]
+        if not actual_tools:
+            # Check if any option requires zero tools (valid no-tool path)
+            empty_option = next((o for o in options if not o.get("tools")), None)
+            if empty_option:
+                checks.append(f"PASS: no tool calls in trace, matched empty option '{empty_option.get('label', '?')}'")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+            checks.append(f"FAIL: no tool calls in trace, no empty option available")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                    "reason": "no_tool_calls_in_trace", "checks": checks}
+
+        for option in options:
+            option_tools: list[str] = option.get("tools") or []
+            if not option_tools:
+                # Empty tools option always matches (any behavior acceptable)
+                checks.append(f"PASS: matched empty-tools option '{option.get('label', '?')}'")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+            ok, _ = all_present(actual_tools, option_tools)
+            if ok:
+                checks.append(f"PASS: matched option '{option.get('label', '?')}' — tools={option_tools}")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+
+        all_option_tools = [o.get("tools", []) for o in options]
+        checks.append(f"FAIL: actual={actual_tools}, options={all_option_tools}")
+        return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                "reason": "no_expected_trajectory_option_matched", "checks": checks}
+
+    # Schema C: expected_trajectory (ordered steps with possible unordered groups)
+    if "expected_trajectory" in expected_output:
+        trajectory: list = expected_output["expected_trajectory"]
+        required_tools = extract_trajectory_tools(trajectory)
+        if not required_tools:
+            checks.append("PASS: expected_trajectory has no required tool names")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+
+        if not actual_tools:
+            checks.append(f"FAIL: no tool calls in trace, expected trajectory tools {required_tools}")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                    "reason": "no_tool_calls_in_trace", "checks": checks}
+
+        ok, missing = all_present(actual_tools, required_tools)
+        if ok:
+            checks.append(f"PASS: all expected_trajectory tools present: {required_tools}")
+        else:
+            checks.append(f"FAIL: actual={actual_tools}, missing trajectory tools={missing}")
+            return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                    "reason": f"missing_required_tool — {missing[0]}", "checks": checks}
+        return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+
+    # Schema D: expected_tools_unordered or expected_tools_must_include
+    for field in ("expected_tools_unordered", "expected_tools_must_include"):
+        if field in expected_output:
+            required_tools: list[str] = expected_output[field]
+            if not required_tools:
+                checks.append(f"PASS: {field} is empty")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+
+            if not actual_tools:
+                checks.append(f"FAIL: no tool calls in trace, expected {required_tools}")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                        "reason": "no_tool_calls_in_trace", "checks": checks}
+
+            ok, missing = all_present(actual_tools, required_tools)
+            if ok:
+                checks.append(f"PASS: all {field} tools present: {required_tools}")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "ok", "checks": checks}
+            else:
+                checks.append(f"FAIL: actual={actual_tools}, missing={missing}")
+                return {"case_id": case_id, "trace_id": trace_id, "passed": False,
+                        "reason": f"missing_required_tool — {missing[0]}", "checks": checks}
+
+    # No scorable tool criteria found — note and pass
+    checks.append("PASS: no auto-scorable tool criteria found in expected_output (manual review needed)")
+    return {"case_id": case_id, "trace_id": trace_id, "passed": True, "reason": "no_scoring_criteria", "checks": checks}
 
 
 def main():
@@ -170,7 +258,6 @@ def main():
     traces_rows  = load_csv(args.traces)
     dataset_rows = load_csv(args.dataset)
 
-    # Index dataset by id
     dataset_by_id: dict[str, dict] = {row["id"]: row for row in dataset_rows}
 
     for trace in traces_rows:
